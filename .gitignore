@@ -1,0 +1,24 @@
+.DS_Store
+
+# Data — share via Zenodo or equivalent
+data-raw/
+data/
+
+# Generated outputs — reproducible from code
+fig/
+reports/
+
+# renv — library is platform-specific; lock file is committed
+renv/library/
+renv/staging/
+
+# Quarto
+_freeze/
+_site/
+.quarto/
+
+# R
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj.user/
