@@ -1,0 +1,547 @@
+---
+title: "log10(exCs137 / total Cs137) — Cubist global vs. per soil type"
+author: Franck Albinet
+date: last-modified
+format:
+  html:
+    toc: true
+    code-fold: true
+    theme: cosmo
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+Does soil type matter for MIR-based prediction of the exchangeable-to-total
+¹³⁷Cs ratio? This notebook addresses that question with two complementary
+analyses:
+
+1. **Global Cubist model** — trained on all soil types combined, with test-set
+   metrics broken down by `Soil_type_describe` to reveal where the single model
+   struggles.
+2. **Per-soil Cubist models** — one independent model per soil type group
+   (minimum 60 samples), each with its own Kennard-Stone split and
+   hyperparameter tuning.
+
+Comparing the variable importance plots across setups should show whether
+certain spectral regions are universally predictive or carry signal only within
+specific soil classes.
+
+# Setup
+
+```{r}
+#| label: libraries
+
+library(tidyverse)
+library(tidymodels)
+library(prospectr)
+library(resemble)
+library(here)
+library(rules)
+library(Cubist)
+
+source(here("R", "utils.R"))
+source(here("R", "load.R"))
+source(here("R", "steps.R"))
+source(here("R", "split.R"))
+
+library(doParallel)
+registerDoParallel(cores = parallel::detectCores() - 1L)
+```
+
+```{r}
+#| label: configuration
+
+WET_PATH     <- here("data-raw", "WetData_2013_2023.csv")
+SPECTRA_PATH <- here("data-raw", "1320_Jumpei_spectra_outlier_full.rds")
+BY_WET       <- "ID"
+BY_SPECTRA   <- "sample_id"
+
+TARGET <- "exCs137_totalCs137"
+
+EXCLUDE_YEARS <- c(2021, 2022, 2023)
+
+RESAMPLE_BY <- 5L
+SG_W        <- 15L   # tuned in 00_tune_sg.qmd
+SG_P        <- 3L    # tuned in 00_tune_sg.qmd
+SG_M        <- 1L    # first derivative
+
+SEED            <- 123L
+TRAIN_PROP      <- 0.80
+CALIB_PROP      <- 0.70
+KS_MAX_EXPL_VAR <- 0.99
+MIN_GROUP_N     <- 60L   # groups below this are skipped
+
+set.seed(SEED)
+```
+
+# Load & Prepare
+
+```{r}
+#| label: load
+
+raw <- load_raw_data(
+  wet_path     = WET_PATH,
+  spectra_path = SPECTRA_PATH,
+  by_wet       = BY_WET,
+  by_spectra   = BY_SPECTRA
+)
+```
+
+Years 2021–2023 are excluded because measurement protocols changed; samples
+with missing or non-positive target values are removed before any split so
+the log transform is well-defined.
+
+```{r}
+#| label: prepare
+
+prepared <- raw |>
+  filter(
+    !year %in% EXCLUDE_YEARS,
+    !is.na(.data[[TARGET]]),
+    .data[[TARGET]] > 0
+  )
+nrow(prepared)
+```
+
+# Shared Cubist specification
+
+Cubist is chosen for its interpretability: it produces a set of rule-based
+linear models whose variable usage statistics give a direct measure of spectral
+feature importance. The same specification and grid are reused for every model
+in this notebook to keep comparisons fair.
+
+The tuning grid searches 20 values of `committees` (1–30) and 10 values of
+`neighbors` (0–9), for 200 candidates evaluated on the validation set.
+
+```{r}
+#| label: cubist-spec
+
+cubist_spec <- cubist_rules(
+  committees = tune(),
+  neighbors  = tune()
+) |>
+  set_engine("Cubist") |>
+  set_mode("regression")
+
+cubist_grid <- grid_regular(
+  committees(range = c(1L, 30L)),
+  neighbors(),
+  levels = c(committees = 20, neighbors = 10)
+)
+```
+
+# Global model
+
+## Split
+
+The dataset is split using the Kennard-Stone algorithm on PCA scores of the
+SNV-preprocessed spectra. This guarantees that the training set covers the
+spectral space as uniformly as possible, rather than leaving gaps that
+random sampling might create. The split proportions (80 % train pool / 70 %
+calibration) are chosen to leave enough samples per soil type in the
+per-soil section while keeping a meaningful test set.
+
+```{r}
+#| label: global-split
+
+global_split <- ks_split(prepared, train_prop = TRAIN_PROP, calib_prop = CALIB_PROP)
+```
+
+## Recipe
+
+The preprocessing chain follows the pipeline established in `01_cs137_ratio.qmd`:
+
+- **log₁₀ transform** of the outcome compresses the right-skewed ratio
+  distribution and stabilises variance.
+- **Spectral resampling** (every `r RESAMPLE_BY` cm⁻¹) reduces collinearity
+  between adjacent channels without discarding information.
+- **SNV** removes multiplicative scatter effects caused by differences in
+  particle size and sample packing.
+- **Savitzky-Golay first derivative** (window `r SG_W`, degree `r SG_P`)
+  suppresses baseline drift and sharpens spectral features; parameters were
+  tuned in `00_tune_sg.qmd`.
+
+```{r}
+#| label: global-recipe
+
+spc_cols  <- grep("^X\\d+", names(training(global_split)), value = TRUE)
+meta_cols <- setdiff(names(training(global_split)), c(TARGET, spc_cols))
+
+global_rec <- recipe(training(global_split)) |>
+  update_role(all_of(TARGET),    new_role = "outcome")   |>
+  update_role(all_of(spc_cols),  new_role = "predictor") |>
+  update_role(all_of(meta_cols), new_role = "metadata")  |>
+  step_log(all_outcomes(), base = 10) |>
+  step_resample(by = RESAMPLE_BY)    |>
+  step_snv()                         |>
+  step_sg(w = SG_W, p = SG_P, m = SG_M)
+```
+
+## Tune
+
+The workflow bundles the recipe and model specification. Hyperparameters are
+selected by minimising RMSE on the held-out validation set.
+
+```{r}
+#| label: global-wf
+
+global_wf <- workflow() |>
+  add_recipe(global_rec) |>
+  add_model(cubist_spec)
+```
+
+```{r}
+#| label: global-tune
+
+global_tuned <- tune_grid(
+  global_wf,
+  resamples = validation_set(global_split),
+  grid      = cubist_grid,
+  metrics   = metric_set(rmse, rsq)
+)
+```
+
+The tuning surface below shows how RMSE and R² vary with the number of
+committees and neighbours. More committees generally improve predictions by
+boosting, while neighbours control the degree of instance-based correction
+applied at prediction time.
+
+```{r}
+#| label: fig-global-tuning
+
+autoplot(global_tuned)
+```
+
+## Final fit
+
+The best hyperparameters are locked in and the model is re-trained on the
+full training set before evaluation on the held-out test set — the only time
+test data are touched.
+
+```{r}
+#| label: global-final
+
+global_final <- global_wf |>
+  finalize_workflow(select_best(global_tuned, metric = "rmse")) |>
+  last_fit(global_split)
+
+collect_metrics(global_final)
+```
+
+## Observed vs predicted
+
+```{r}
+#| label: fig-global-obs-pred
+
+collect_predictions(global_final) |>
+  ggplot(aes(x = .pred, y = .data[[TARGET]])) +
+  geom_point(alpha = 0.4) +
+  geom_abline(colour = "red", linetype = "dashed") +
+  coord_obs_pred() +
+  labs(
+    x     = "Predicted log10(exCs137 / totalCs137)",
+    y     = "Observed log10(exCs137 / totalCs137)",
+    title = glue::glue(
+      "Global Cubist  |  RMSE = {round(collect_metrics(global_final) |> filter(.metric == 'rmse') |> pull(.estimate), 3)},",
+      "  R² = {round(collect_metrics(global_final) |> filter(.metric == 'rsq') |> pull(.estimate), 3)}"
+    )
+  )
+```
+
+## Metrics by soil type
+
+A single global model may hide heterogeneous behaviour across soil types. The
+table below breaks down test-set performance by `Soil_type_describe`, using
+the same predictions — no additional model fits are involved.
+
+```{r}
+#| label: global-metrics-by-soil
+
+collect_predictions(global_final) |>
+  left_join(
+    testing(global_split) |>
+      mutate(.row = row_number()) |>
+      select(.row, Soil_type_describe),
+    by = ".row"
+  ) |>
+  group_by(Soil_type_describe) |>
+  metrics(truth = !!sym(TARGET), estimate = .pred) |>
+  print(n = Inf)
+```
+
+## Variable importance
+
+Cubist reports variable usage as the percentage of rules and linear model
+terms in which each predictor appears. Plotting this against wavenumber gives
+a spectral importance profile directly interpretable in terms of known soil
+absorption bands.
+
+```{r}
+#| label: fig-global-vip
+
+extract_fit_engine(global_final)$usage |>
+  mutate(
+    importance = Conditions + Model,
+    wn         = as.numeric(str_remove(Variable, "^X"))
+  ) |>
+  filter(!is.na(wn)) |>
+  ggplot(aes(x = wn, y = importance)) +
+  geom_line() +
+  scale_x_reverse() +
+  labs(
+    x     = expression("Wavenumber /" * cm^-1),
+    y     = "Variable usage (%)",
+    title = "Global model — variable importance"
+  )
+```
+
+# Per-soil models
+
+If soil mineralogy and organic matter content vary substantially between
+`Soil_type_describe` groups, a single global model may be suboptimal for all
+of them. Here, an independent Cubist model is fitted for each group with at
+least `r MIN_GROUP_N` samples. Each model gets its own Kennard-Stone split
+and its own hyperparameter search — there is no information sharing between
+groups.
+
+## Group sizes
+
+```{r}
+#| label: soil-group-sizes
+
+group_sizes <- prepared |>
+  count(Soil_type_describe, name = "n") |>
+  arrange(desc(n))
+
+group_sizes
+
+skipped <- group_sizes |> filter(n < MIN_GROUP_N)
+if (nrow(skipped) > 0) {
+  message(
+    "Skipping ", nrow(skipped), " group(s) with n < ", MIN_GROUP_N, ": ",
+    paste(skipped$Soil_type_describe, collapse = ", ")
+  )
+}
+```
+
+## Fit per group
+
+`fit_soil_cubist()` encapsulates the full pipeline for a single group: split,
+recipe, workflow, tuning, and final fit. Applying it via `map()` over the
+`group_split()` result keeps the per-group logic in one place and returns a
+uniform list structure that downstream display code can iterate over.
+
+```{r}
+#| label: soil-fit-fn
+
+# Fit a Cubist workflow on one subset; returns a named list
+fit_soil_cubist <- function(grp, label = unique(grp$Soil_type_describe)) {
+  split <- ks_split(grp, train_prop = TRAIN_PROP, calib_prop = CALIB_PROP)
+
+  spc_cols  <- grep("^X\\d+", names(training(split)), value = TRUE)
+  meta_cols <- setdiff(names(training(split)), c(TARGET, spc_cols))
+
+  rec <- recipe(training(split)) |>
+    update_role(all_of(TARGET),    new_role = "outcome")   |>
+    update_role(all_of(spc_cols),  new_role = "predictor") |>
+    update_role(all_of(meta_cols), new_role = "metadata")  |>
+    step_log(all_outcomes(), base = 10) |>
+    step_resample(by = RESAMPLE_BY)    |>
+    step_snv()                         |>
+    step_sg(w = SG_W, p = SG_P, m = SG_M)
+
+  wf <- workflow() |>
+    add_recipe(rec) |>
+    add_model(cubist_spec)
+
+  tuned <- tune_grid(
+    wf,
+    resamples = validation_set(split),
+    grid      = cubist_grid,
+    metrics   = metric_set(rmse, rsq)
+  )
+
+  final <- wf |>
+    finalize_workflow(select_best(tuned, metric = "rmse")) |>
+    last_fit(split)
+
+  list(
+    label = label,
+    n     = nrow(grp),
+    split = split,
+    tuned = tuned,
+    final = final
+  )
+}
+```
+
+```{r}
+#| label: soil-fit
+
+soil_results <- prepared |>
+  group_by(Soil_type_describe) |>
+  filter(n() >= MIN_GROUP_N) |>
+  group_split() |>
+  map(fit_soil_cubist)
+```
+
+## Results per soil type
+
+For each group, the observed-vs-predicted plot and the spectral importance
+profile are shown side by side. Key questions: does predictive accuracy
+improve relative to the global model? Do the important spectral regions shift
+between soil types, suggesting that different mineral or organic components
+drive Cs exchangeability depending on soil class?
+
+```{r}
+#| label: fig-soil-results
+
+walk(soil_results, function(res) {
+  mets     <- collect_metrics(res$final)
+  rmse_val <- mets |> filter(.metric == "rmse") |> pull(.estimate) |> round(3)
+  rsq_val  <- mets |> filter(.metric == "rsq")  |> pull(.estimate) |> round(3)
+
+  p_obs_pred <- collect_predictions(res$final) |>
+    ggplot(aes(x = .pred, y = .data[[TARGET]])) +
+    geom_point(alpha = 0.4) +
+    geom_abline(colour = "red", linetype = "dashed") +
+    coord_obs_pred() +
+    labs(
+      x     = "Predicted log10(exCs137 / totalCs137)",
+      y     = "Observed log10(exCs137 / totalCs137)",
+      title = glue::glue(
+        "{res$label}  (n = {res$n})  |  RMSE = {rmse_val},  R² = {rsq_val}"
+      )
+    )
+
+  p_vip <- extract_fit_engine(res$final)$usage |>
+    mutate(
+      importance = Conditions + Model,
+      wn         = as.numeric(str_remove(Variable, "^X"))
+    ) |>
+    filter(!is.na(wn)) |>
+    ggplot(aes(x = wn, y = importance)) +
+    geom_line() +
+    scale_x_reverse() +
+    labs(
+      x     = expression("Wavenumber /" * cm^-1),
+      y     = "Variable usage (%)",
+      title = glue::glue("{res$label} — variable importance")
+    )
+
+  print(p_obs_pred)
+  print(p_vip)
+})
+```
+
+## Metrics summary
+
+The table below collects test-set RMSE and R² for every per-soil model,
+sorted by R². Comparing these figures against the corresponding rows in the
+global-model breakdown above quantifies the gain — or lack thereof — from
+soil-type stratification.
+
+```{r}
+#| label: soil-metrics-summary
+
+map(soil_results, function(res) {
+  collect_metrics(res$final) |>
+    mutate(soil_type = res$label, n = res$n)
+}) |>
+  list_rbind() |>
+  select(soil_type, n, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  arrange(desc(rsq))
+```
+
+# Lowland soil — by field type
+
+Within Lowland soil, two distinct agricultural contexts coexist: paddy fields
+(flooded rice cultivation, n = 684) and upland fields (n = 303). Flooding
+cycles alter soil redox chemistry and organic matter dynamics, which could
+affect both Cs exchangeability and its spectral expression. A separate Cubist
+model for each field type tests whether this distinction matters for
+prediction and whether the important spectral features shift between contexts.
+
+## Group sizes
+
+```{r}
+#| label: lowland-group-sizes
+
+prepared |>
+  filter(Soil_type_describe == "Lowland soil") |>
+  count(fieldtype, sort = TRUE)
+```
+
+## Fit per field type
+
+```{r}
+#| label: lowland-fit
+
+lowland_results <- prepared |>
+  filter(Soil_type_describe == "Lowland soil") |>
+  group_by(fieldtype) |>
+  filter(n() >= MIN_GROUP_N) |>
+  group_split() |>
+  map(\(grp) fit_soil_cubist(grp, label = unique(grp$fieldtype)))
+```
+
+## Results per field type
+
+```{r}
+#| label: fig-lowland-results
+
+walk(lowland_results, function(res) {
+  mets     <- collect_metrics(res$final)
+  rmse_val <- mets |> filter(.metric == "rmse") |> pull(.estimate) |> round(3)
+  rsq_val  <- mets |> filter(.metric == "rsq")  |> pull(.estimate) |> round(3)
+
+  p_obs_pred <- collect_predictions(res$final) |>
+    ggplot(aes(x = .pred, y = .data[[TARGET]])) +
+    geom_point(alpha = 0.4) +
+    geom_abline(colour = "red", linetype = "dashed") +
+    coord_obs_pred() +
+    labs(
+      x     = "Predicted log10(exCs137 / totalCs137)",
+      y     = "Observed log10(exCs137 / totalCs137)",
+      title = glue::glue(
+        "Lowland — {res$label}  (n = {res$n})  |  RMSE = {rmse_val},  R² = {rsq_val}"
+      )
+    )
+
+  p_vip <- extract_fit_engine(res$final)$usage |>
+    mutate(
+      importance = Conditions + Model,
+      wn         = as.numeric(str_remove(Variable, "^X"))
+    ) |>
+    filter(!is.na(wn)) |>
+    ggplot(aes(x = wn, y = importance)) +
+    geom_line() +
+    scale_x_reverse() +
+    labs(
+      x     = expression("Wavenumber /" * cm^-1),
+      y     = "Variable usage (%)",
+      title = glue::glue("Lowland — {res$label} — variable importance")
+    )
+
+  print(p_obs_pred)
+  print(p_vip)
+})
+```
+
+## Metrics summary
+
+```{r}
+#| label: lowland-metrics-summary
+
+map(lowland_results, function(res) {
+  collect_metrics(res$final) |>
+    mutate(field_type = res$label, n = res$n)
+}) |>
+  list_rbind() |>
+  select(field_type, n, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  arrange(desc(rsq))
+```

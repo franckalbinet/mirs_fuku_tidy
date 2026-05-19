@@ -94,3 +94,35 @@ Ideally, we'd like:
 - `renv::snapshot(type = "all")` when adding packages
 
 ---
+
+## 6. Current task
+
+1. Now: add RF, XGBoost, LS-SVM to cs137_ratio.qmd (same recipe, same validation_set(split))
+2. Then: compare all 5 models — this is already a publishable result
+3. If motivated by results: open a separate explore_preprocessing.qmd to try PCA/PLS preprocessing (recipes step) variants for the models that
+could benefit. The PCA/PLS question is real but it's a second-order experiment. Running it first would be premature optimisation —
+you don't yet know which models are worth investing in for this dataset.
+
+## 7. Interpretation
+
+Based on Cubist feature importance while predicting cs137 ratio:
+
+~3500–3700 cm⁻¹ (~70–80%): O-H stretching in clay minerals — kaolinite has characteristic bands at 3620 and 3695
+  cm⁻¹, halloysite similarly. Directly relevant: clay mineralogy controls Cs fixation capacity.
+
+  ~3300–3400 cm⁻¹ (~60%): Broader O-H stretch, associated with hydrogen-bonded O-H in organic matter or interlayer
+  water.
+
+  ~2300–2500 cm⁻¹ (small cluster, ~20%): Carbonate combination bands or atmospheric CO₂ region (~2349 cm⁻¹) — worth
+  checking with domain experts whether this is a real signal or an instrument artefact.
+
+  ~1800 cm⁻¹ (~98%, dominant): C=O stretching — organic matter (carboxylates) or carbonate overtones. As noted,
+  physically plausible for Cs exchangeability.
+
+  ~1900–2000 cm⁻¹ (~65–80%): Si-O combination modes or carbonate combination bands.
+
+  ~700–900 cm⁻¹ (~90%, rightmost high peak): Si-O bending in quartz (~800 cm⁻¹) and Al-OH deformation in kaolinite
+  (~912, ~937 cm⁻¹). Clay mineral fingerprint region.
+
+  Overall the plot is coherent — clay mineralogy (O-H and Si-O regions) and organic matter (C=O) dominate, both of
+  which are physically meaningful drivers of Cs exchangeability in Fukushima soils.

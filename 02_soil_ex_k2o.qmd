@@ -1,5 +1,5 @@
 ---
-title: "log10(exCs137 / total Cs137) — MIR prediction pipeline"
+title: "log10(soil_ex_K2O) — MIR prediction pipeline"
 author: Franck Albinet
 date: last-modified
 format:
@@ -26,13 +26,15 @@ library(here)
 library(plsmod)
 library(rules)
 library(Cubist)
-library(kernlab)
 library(hexbin)
 
 source(here("R", "utils.R"))
 source(here("R", "load.R"))
 source(here("R", "steps.R"))
 source(here("R", "split.R"))
+
+library(doParallel)
+registerDoParallel(cores = parallel::detectCores() - 1L)
 ```
 
 ```{r}
@@ -45,7 +47,7 @@ BY_WET       <- "ID"
 BY_SPECTRA   <- "sample_id"
 
 # --- Target property --------------------------------------------------------
-TARGET <- "exCs137_totalCs137"
+TARGET <- "soil_ex_K2O"
 
 # --- Filtering --------------------------------------------------------------
 EXCLUDE_YEARS <- c(2021, 2022, 2023)
@@ -120,10 +122,11 @@ rec <- recipe(training(split)) |>
   update_role(all_of(TARGET),    new_role = "outcome")   |>
   update_role(all_of(spc_cols),  new_role = "predictor") |>
   update_role(all_of(meta_cols), new_role = "metadata")  |>
-  step_log(all_outcomes())                 |>
+  step_log(all_outcomes(), base = 10)      |>
   step_resample(by = RESAMPLE_BY)          |>
   step_snv()                               |>
-  step_sg(w = SG_W, p = SG_P, m = SG_M)
+  step_sg(w = SG_W, p = SG_P, m = SG_M)  |>
+  step_rm_co2()
 ```
 
 ```{r}
@@ -227,8 +230,8 @@ pls_preds |>
   geom_abline(colour = "red", linetype = "dashed") +
   coord_obs_pred() +
   labs(
-    x     = "Predicted log10(exCs137 / totalCs137)",
-    y     = "Observed log10(exCs137 / totalCs137)",
+    x     = "Predicted log10(soil_ex_K2O)",
+    y     = "Observed log10(soil_ex_K2O)",
     title = glue::glue(
       "PLSR test set  |  RMSE = {round(collect_metrics(pls_final) |> filter(.metric == 'rmse') |> pull(.estimate), 3)},",
       "  R² = {round(collect_metrics(pls_final) |> filter(.metric == 'rsq') |> pull(.estimate), 3)}"
@@ -263,10 +266,16 @@ cubist_wf <- workflow() |>
 ```{r}
 #| label: cubist-tune
 
+cubist_grid <- grid_regular(
+  committees(range = c(1L, 30L)),
+  neighbors(),
+  levels = c(committees = 20, neighbors = 10)
+)
+
 cubist_tuned <- tune_grid(
   cubist_wf,
   resamples = validation_set(split),
-  grid      = GRID_SIZE,
+  grid      = cubist_grid,
   metrics   = metric_set(rmse, rsq)
 )
 ```
@@ -297,8 +306,8 @@ collect_predictions(cubist_final) |>
   geom_abline(colour = "red", linetype = "dashed") +
   coord_obs_pred() +
   labs(
-    x     = "Predicted log10(exCs137 / totalCs137)",
-    y     = "Observed log10(exCs137 / totalCs137)",
+    x     = "Predicted log10(soil_ex_K2O)",
+    y     = "Observed log10(soil_ex_K2O)",
     title = glue::glue(
       "Cubist test set  |  RMSE = {round(collect_metrics(cubist_final) |> filter(.metric == 'rmse') |> pull(.estimate), 3)},",
       "  R² = {round(collect_metrics(cubist_final) |> filter(.metric == 'rsq') |> pull(.estimate), 3)}"
@@ -311,4 +320,22 @@ collect_predictions(cubist_final) |>
     obs_orig  = 10^.data[[TARGET]]
   ) |>
   metrics(truth = obs_orig, estimate = pred_orig)
+```
+
+```{r}
+#| label: fig-cubist-vip
+
+extract_fit_engine(cubist_final)$usage |>
+  mutate(
+    importance = Conditions + Model,
+    wn         = as.numeric(str_remove(Variable, "^X"))
+  ) |>
+  filter(!is.na(wn)) |>
+  ggplot(aes(x = wn, y = importance)) +
+  geom_line() +
+  scale_x_reverse() +
+  labs(
+    x = expression("Wavenumber /" * cm^-1),
+    y = "Variable usage (%)"
+  )
 ```

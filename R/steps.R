@@ -397,3 +397,96 @@ resample_by <- function(range = c(1, 20), trans = NULL) {
     label     = c(resample_by = "Resampling Interval")
   )
 }
+
+
+# ── Constructor (user-facing) ─────────────────────────────────────────────────
+step_rm_co2 <- function(
+  recipe,
+  ...,
+  min_wn  = 2269,
+  max_wn  = 2389,
+  role    = NA,
+  trained = FALSE,
+  skip    = FALSE,
+  id      = rand_id("rm_co2")
+) {
+  terms <- enquos(...)
+  if (is_empty(terms)) terms <- quos(all_predictors())
+
+  add_step(
+    recipe,
+    step_rm_co2_new(
+      terms   = terms,
+      min_wn  = min_wn,
+      max_wn  = max_wn,
+      cols    = NULL,
+      role    = role,
+      trained = trained,
+      skip    = skip,
+      id      = id
+    )
+  )
+}
+
+# ── Internal constructor ───────────────────────────────────────────────────────
+step_rm_co2_new <- function(terms, min_wn, max_wn, cols, role, trained, skip, id) {
+  step(
+    subclass = "rm_co2",
+    terms    = terms,
+    min_wn   = min_wn,
+    max_wn   = max_wn,
+    cols     = cols,
+    role     = role,
+    trained  = trained,
+    skip     = skip,
+    id       = id
+  )
+}
+
+# ── prep: identify wavenumber columns within the CO2 band ─────────────────────
+prep.step_rm_co2 <- function(x, training, info = NULL, ...) {
+  all_cols <- recipes_eval_select(x$terms, training, info)
+  wns      <- as.numeric(sub("^X", "", all_cols))
+  cols     <- all_cols[!is.na(wns) & wns >= x$min_wn & wns <= x$max_wn]
+
+  step_rm_co2_new(
+    terms   = x$terms,
+    min_wn  = x$min_wn,
+    max_wn  = x$max_wn,
+    cols    = cols,
+    role    = x$role,
+    trained = TRUE,
+    skip    = x$skip,
+    id      = x$id
+  )
+}
+
+# ── bake: drop the CO2 band columns ───────────────────────────────────────────
+bake.step_rm_co2 <- function(object, new_data, ...) {
+  check_new_data(object$cols, object, new_data)
+  new_data |> select(-all_of(object$cols))
+}
+
+# ── print ──────────────────────────────────────────────────────────────────────
+print.step_rm_co2 <- function(x, width = max(20, options()$width - 35), ...) {
+  title <- glue::glue("CO2 band removal ({x$min_wn}–{x$max_wn} cm⁻¹) on ")
+  print_step(
+    tr_obj   = x$cols,
+    untr_obj = x$terms,
+    trained  = x$trained,
+    title    = title,
+    width    = width
+  )
+  invisible(x)
+}
+
+# ── tidy: one row per removed column ──────────────────────────────────────────
+tidy.step_rm_co2 <- function(x, ...) {
+  if (is_trained(x)) {
+    res <- tibble::tibble(terms = x$cols)
+  } else {
+    res <- tibble::tibble(terms = recipes::sel2char(x$terms))
+  }
+  res$id <- x$id
+  res
+}

@@ -1,0 +1,529 @@
+---
+title: "log10(exCs137 / total Cs137) — MIR prediction pipeline"
+author: Franck Albinet
+date: last-modified
+format:
+  html:
+    toc: true
+    code-fold: true
+    theme: cosmo
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Setup
+
+```{r}
+#| label: libraries
+
+library(tidyverse)
+library(tidymodels)
+library(prospectr)
+library(resemble)
+library(here)
+library(plsmod)
+library(rules)
+library(Cubist)
+library(kernlab)
+library(hexbin)
+library(ranger)
+library(xgboost)
+
+source(here("R", "utils.R"))
+source(here("R", "load.R"))
+source(here("R", "steps.R"))
+source(here("R", "split.R"))
+
+library(doParallel)
+registerDoParallel(cores = parallel::detectCores() - 1L)
+```
+
+```{r}
+#| label: configuration
+
+# --- Data -------------------------------------------------------------------
+WET_PATH     <- here("data-raw", "WetData_2013_2023.csv")
+SPECTRA_PATH <- here("data-raw", "1320_Jumpei_spectra_outlier_full.rds")
+BY_WET       <- "ID"
+BY_SPECTRA   <- "sample_id"
+
+# --- Target property --------------------------------------------------------
+TARGET <- "exCs137_totalCs137"
+
+# --- Filtering --------------------------------------------------------------
+EXCLUDE_YEARS <- c(2021, 2022, 2023)
+
+# --- Preprocessing ----------------------------------------------------------
+RESAMPLE_BY <- 5L
+SG_W        <- 15L   # tuned in tune_sg.qmd
+SG_P        <- 3L    # tuned in tune_sg.qmd
+SG_M        <- 1L    # first derivative — confirmed in tune_sg.qmd
+
+# --- Splitting --------------------------------------------------------------
+SEED            <- 123L
+TRAIN_PROP      <- 0.75
+CALIB_PROP      <- 0.65
+KS_MAX_EXPL_VAR <- 0.99
+
+# --- Model ------------------------------------------------------------------
+MAX_NCOMP     <- 50L
+GRID_SIZE     <- 20L
+RF_TREES      <- 1000L
+XGB_TREES     <- 500L
+XGB_GRID_SIZE <- 50L
+
+set.seed(SEED)
+```
+
+# Load Data
+
+```{r}
+#| label: load
+
+raw <- load_raw_data(
+  wet_path     = WET_PATH,
+  spectra_path = SPECTRA_PATH,
+  by_wet       = BY_WET,
+  by_spectra   = BY_SPECTRA
+)
+
+glimpse(raw)
+```
+
+# Prepare
+
+```{r}
+#| label: prepare
+
+prepared <- raw |>
+  filter(
+    !year %in% EXCLUDE_YEARS,
+    !is.na(.data[[TARGET]]),
+    .data[[TARGET]] > 0
+  )
+nrow(prepared)
+```
+
+
+```{r}
+prepared |>
+    ggplot(aes(x = exCs137_totalCs137)) +
+    geom_histogram(bins = 50) +
+    labs(x = "exCs137 / totalCs137", title = "Raw scale")
+```
+
+```{r}
+prepared |>
+    slice_min(exCs137_totalCs137, prop = 0.01) |>
+    select(year, ID, field_no, Soil_type, Soil_type_describe, exCs137_totalCs137) |>
+    arrange(exCs137_totalCs137)
+```
+# Split
+
+## Using Kennard-Stone
+
+```{r}
+#| label: split
+
+split <- ks_split(prepared, train_prop = TRAIN_PROP, calib_prop = CALIB_PROP)
+```
+
+# Recipe
+
+```{r}
+#| label: recipe
+
+spc_cols  <- grep("^X\\d+", names(training(split)), value = TRUE)
+meta_cols <- setdiff(names(training(split)), c(TARGET, spc_cols))
+
+rec <- recipe(training(split)) |>
+  update_role(all_of(TARGET),    new_role = "outcome")   |>
+  update_role(all_of(spc_cols),  new_role = "predictor") |>
+  update_role(all_of(meta_cols), new_role = "metadata")  |>
+  step_log(all_outcomes())                 |>
+  step_resample(by = RESAMPLE_BY)          |>
+  step_snv()                               |>
+  step_sg(w = SG_W, p = SG_P, m = SG_M) 
+  # step_rm_co2()
+```
+
+```{r}
+#| label: plot-spectra-fn
+
+plot_spectra <- function(data, title = NULL, ylim = NULL) {
+  wns <- get_wns(data)
+  spc <- as.matrix(data[, get_wn_cols(data)])
+
+  matplot(
+    x    = wns,
+    y    = t(spc),
+    xlab = expression("Wavenumber /" * cm^-1),
+    ylab = "Absorbance",
+    xlim = c(max(wns), min(wns)),
+    ylim = ylim,
+    main = title,
+    type = "l", lty = 1,
+    col  = rgb(0.5, 0.5, 0.5, 0.3)
+  )
+}
+```
+
+As a visual check:
+
+```{r}
+#| label: fig-spectra-check
+
+rec_prepped <- prep(rec)
+train_baked <- bake(rec_prepped, new_data = NULL)
+
+par(mfrow = c(1, 2))
+plot_spectra(training(split), title = "Raw")
+plot_spectra(train_baked,     title = "Preprocessed")
+par(mfrow = c(1, 1))
+```
+
+# Workflow
+
+## PLSR
+
+```{r}
+#| label: pls-spec
+
+pls_spec <- pls(num_comp = tune()) |>
+  set_engine("mixOmics") |>
+  set_mode("regression")
+
+pls_spec
+```
+
+```{r}
+#| label: pls-workflow
+
+pls_wf <- workflow() |>
+  add_recipe(rec) |>
+  add_model(pls_spec)
+```
+
+```{r}
+#| label: pls-grid
+
+pls_grid <- tibble(num_comp = seq_len(MAX_NCOMP))
+```
+
+```{r}
+#| label: pls-tune
+
+pls_tuned <- tune_grid(
+  pls_wf,
+  resamples = validation_set(split),
+  grid      = pls_grid,
+  metrics   = metric_set(rmse, rsq)
+)
+```
+
+```{r}
+#| label: fig-pls-tuning
+
+autoplot(pls_tuned)
+```
+
+```{r}
+#| label: pls-final
+
+pls_final <- pls_wf |>
+  finalize_workflow(select_best(pls_tuned, metric = "rmse")) |>
+  last_fit(split)
+
+collect_metrics(pls_final)
+```
+
+```{r}
+#| label: fig-pls-obs-pred
+
+pls_preds <- collect_predictions(pls_final)
+
+pls_preds |>
+  ggplot(aes(x = .pred, y = .data[[TARGET]])) +
+  geom_point(alpha = 0.4) +
+  geom_abline(colour = "red", linetype = "dashed") +
+  coord_obs_pred() +
+  labs(
+    x     = "Predicted log10(exCs137 / totalCs137)",
+    y     = "Observed log10(exCs137 / totalCs137)",
+    title = glue::glue(
+      "PLSR test set  |  RMSE = {round(collect_metrics(pls_final) |> filter(.metric == 'rmse') |> pull(.estimate), 3)},",
+      "  R² = {round(collect_metrics(pls_final) |> filter(.metric == 'rsq') |> pull(.estimate), 3)}"
+    )
+  )
+
+pls_preds |>
+  mutate(
+    pred_orig = 10^.pred,
+    obs_orig  = 10^.data[[TARGET]]
+  ) |>
+  metrics(truth = obs_orig, estimate = pred_orig)
+```
+
+## Cubist
+
+```{r}
+#| label: cubist-spec
+
+cubist_spec <- cubist_rules(
+  committees = tune(),
+  neighbors  = tune()
+) |>
+  set_engine("Cubist") |>
+  set_mode("regression")
+
+cubist_wf <- workflow() |>
+  add_recipe(rec) |>
+  add_model(cubist_spec)
+```
+
+```{r}
+#| label: cubist-tune
+
+cubist_grid <- grid_regular(
+  committees(range = c(1L, 30L)),
+  neighbors(),
+  levels = c(committees = 20, neighbors = 10)
+)
+
+cubist_tuned <- tune_grid(
+  cubist_wf,
+  resamples = validation_set(split),
+  grid      = cubist_grid,
+  metrics   = metric_set(rmse, rsq)
+)
+```
+
+```{r}
+#| label: fig-cubist-tuning
+
+autoplot(cubist_tuned)
+select_best(cubist_tuned, metric = "rmse")
+```
+
+```{r}
+#| label: cubist-final
+
+cubist_final <- cubist_wf |>
+  finalize_workflow(select_best(cubist_tuned, metric = "rmse")) |>
+  last_fit(split)
+
+collect_metrics(cubist_final)
+```
+
+```{r}
+#| label: fig-cubist-obs-pred
+
+collect_predictions(cubist_final) |>
+  ggplot(aes(x = .pred, y = .data[[TARGET]])) +
+  geom_point(alpha = 0.4) +
+  geom_abline(colour = "red", linetype = "dashed") +
+  coord_obs_pred() +
+  labs(
+    x     = "Predicted log10(exCs137 / totalCs137)",
+    y     = "Observed log10(exCs137 / totalCs137)",
+    title = glue::glue(
+      "Cubist test set  |  RMSE = {round(collect_metrics(cubist_final) |> filter(.metric == 'rmse') |> pull(.estimate), 3)},",
+      "  R² = {round(collect_metrics(cubist_final) |> filter(.metric == 'rsq') |> pull(.estimate), 3)}"
+    )
+  )
+
+collect_predictions(cubist_final) |>
+  mutate(
+    pred_orig = 10^.pred,
+    obs_orig  = 10^.data[[TARGET]]
+  ) |>
+  metrics(truth = obs_orig, estimate = pred_orig)
+```
+
+```{r}
+#| label: fig-cubist-vip
+
+extract_fit_engine(cubist_final)$usage |>
+  mutate(
+    importance = Conditions + Model,
+    wn         = as.numeric(str_remove(Variable, "^X"))
+  ) |>
+  filter(!is.na(wn)) |>
+  ggplot(aes(x = wn, y = importance)) +
+  geom_line() +
+  scale_x_reverse() +
+  labs(
+    x = expression("Wavenumber /" * cm^-1),
+    y = "Variable usage (%)"
+  )
+```
+
+```{r}
+collect_predictions(cubist_final) |>
+    filter(.data[[TARGET]] < -5.5) |>
+    left_join(
+      testing(split) |>
+        mutate(.row = row_number()) |>
+        select(-.data[[TARGET]]),
+      by = ".row"
+    ) |>
+    select(.row, .pred, all_of(TARGET), year, everything())
+```
+
+## Random Forest
+
+```{r}
+#| label: rf-spec
+
+rf_spec <- rand_forest(
+  mtry  = tune(),
+  min_n = tune(),
+  trees = RF_TREES
+) |>
+  set_engine("ranger") |>
+  set_mode("regression")
+
+rf_wf <- workflow() |>
+  add_recipe(rec) |>
+  add_model(rf_spec)
+```
+
+```{r}
+#| label: rf-tune
+
+rf_tuned <- tune_grid(
+  rf_wf,
+  resamples = validation_set(split),
+  grid      = GRID_SIZE,
+  metrics   = metric_set(rmse, rsq)
+)
+```
+
+```{r}
+#| label: fig-rf-tuning
+
+autoplot(rf_tuned)
+select_best(rf_tuned, metric = "rmse")
+```
+
+```{r}
+#| label: rf-final
+
+rf_final <- rf_wf |>
+  finalize_workflow(select_best(rf_tuned, metric = "rmse")) |>
+  last_fit(split)
+
+collect_metrics(rf_final)
+```
+
+```{r}
+#| label: fig-rf-obs-pred
+
+collect_predictions(rf_final) |>
+  ggplot(aes(x = .pred, y = .data[[TARGET]])) +
+  geom_point(alpha = 0.4) +
+  geom_abline(colour = "red", linetype = "dashed") +
+  coord_obs_pred() +
+  labs(
+    x     = "Predicted log10(exCs137 / totalCs137)",
+    y     = "Observed log10(exCs137 / totalCs137)",
+    title = glue::glue(
+      "RF test set  |  RMSE = {round(collect_metrics(rf_final) |> filter(.metric == 'rmse') |> pull(.estimate), 3)},",
+      "  R² = {round(collect_metrics(rf_final) |> filter(.metric == 'rsq') |> pull(.estimate), 3)}"
+    )
+  )
+
+collect_predictions(rf_final) |>
+  mutate(
+    pred_orig = 10^.pred,
+    obs_orig  = 10^.data[[TARGET]]
+  ) |>
+  metrics(truth = obs_orig, estimate = pred_orig)
+```
+
+## XGBoost
+
+```{r}
+#| label: xgb-spec
+
+xgb_spec <- boost_tree(
+  trees          = XGB_TREES,
+  mtry           = tune(),
+  min_n          = tune(),
+  tree_depth     = tune(),
+  learn_rate     = tune(),
+  loss_reduction = tune(),
+  sample_size    = tune()
+) |>
+  set_engine("xgboost") |>
+  set_mode("regression")
+
+xgb_wf <- workflow() |>
+  add_recipe(rec) |>
+  add_model(xgb_spec)
+```
+
+```{r}
+#| label: xgb-tune
+
+xgb_grid <- grid_space_filling(
+  finalize(mtry(), train_baked |> select(starts_with("X"))),
+  min_n(),
+  tree_depth(),
+  learn_rate(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  size = XGB_GRID_SIZE
+)
+
+xgb_tuned <- tune_grid(
+  xgb_wf,
+  resamples = validation_set(split),
+  grid      = xgb_grid,
+  metrics   = metric_set(rmse, rsq)
+)
+```
+
+```{r}
+#| label: fig-xgb-tuning
+
+autoplot(xgb_tuned)
+select_best(xgb_tuned, metric = "rmse")
+```
+
+```{r}
+#| label: xgb-final
+
+xgb_final <- xgb_wf |>
+  finalize_workflow(select_best(xgb_tuned, metric = "rmse")) |>
+  last_fit(split)
+
+collect_metrics(xgb_final)
+```
+
+```{r}
+#| label: fig-xgb-obs-pred
+
+collect_predictions(xgb_final) |>
+  ggplot(aes(x = .pred, y = .data[[TARGET]])) +
+  geom_point(alpha = 0.4) +
+  geom_abline(colour = "red", linetype = "dashed") +
+  coord_obs_pred() +
+  labs(
+    x     = "Predicted log10(exCs137 / totalCs137)",
+    y     = "Observed log10(exCs137 / totalCs137)",
+    title = glue::glue(
+      "XGBoost test set  |  RMSE = {round(collect_metrics(xgb_final) |> filter(.metric == 'rmse') |> pull(.estimate), 3)},",
+      "  R² = {round(collect_metrics(xgb_final) |> filter(.metric == 'rsq') |> pull(.estimate), 3)}"
+    )
+  )
+
+collect_predictions(xgb_final) |>
+  mutate(
+    pred_orig = 10^.pred,
+    obs_orig  = 10^.data[[TARGET]]
+  ) |>
+  metrics(truth = obs_orig, estimate = pred_orig)
+```
