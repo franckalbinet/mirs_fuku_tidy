@@ -207,14 +207,14 @@ tidy.step_sg <- function(x, ...) {
   res
 }
 
-# ── tunable: declare hyperparameters for tune ─────────────────────────────────
+# ── tunable: w, p, and m are all tunable ──────────────────────────────────────
 tunable.step_sg <- function(x, ...) {
   tibble::tibble(
-    name = c("w", "p", "m"),
+    name      = c("w", "p", "m"),
     call_info = list(
-      list(pkg = "your_pkg", fun = "sg_window"),
-      list(pkg = "your_pkg", fun = "sg_degree"),
-      list(pkg = "your_pkg", fun = "sg_diff_order")
+      list(pkg = NULL, fun = "sg_window"),
+      list(pkg = NULL, fun = "sg_degree"),
+      list(pkg = NULL, fun = "sg_diff_order")
     ),
     source       = "recipe",
     component    = "step_sg",
@@ -355,6 +355,36 @@ tunable.step_resample <- function(x, ...) {
     source       = "recipe",
     component    = "step_resample",
     component_id = x$id
+  )
+}
+
+sg_window <- function(range = c(5L, 21L), trans = NULL) {
+  dials::new_quant_param(
+    type      = "integer",
+    range     = range,
+    inclusive = c(TRUE, TRUE),
+    trans     = trans,
+    label     = c(sg_window = "SG Window Size")
+  )
+}
+
+sg_degree <- function(range = c(1L, 3L), trans = NULL) {
+  dials::new_quant_param(
+    type      = "integer",
+    range     = range,
+    inclusive = c(TRUE, TRUE),
+    trans     = trans,
+    label     = c(sg_degree = "SG Polynomial Degree")
+  )
+}
+
+sg_diff_order <- function(range = c(0L, 2L), trans = NULL) {
+  dials::new_quant_param(
+    type      = "integer",
+    range     = range,
+    inclusive = c(TRUE, TRUE),
+    trans     = trans,
+    label     = c(sg_diff_order = "SG Derivative Order")
   )
 }
 

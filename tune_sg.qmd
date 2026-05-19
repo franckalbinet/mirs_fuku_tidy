@@ -1,0 +1,216 @@
+---
+title: "Savitzky-Golay parameter tuning — joint optimisation with PLSR"
+author: Franck Albinet
+date: last-modified
+format:
+  html:
+    toc: true
+    code-fold: true
+    theme: cosmo
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Setup
+
+```{r}
+#| label: libraries
+
+library(tidyverse)
+library(tidymodels)
+library(prospectr)
+library(resemble)
+library(here)
+library(plsmod)
+
+source(here("R", "utils.R"))
+source(here("R", "load.R"))
+source(here("R", "steps.R"))
+source(here("R", "split.R"))
+```
+
+```{r}
+#| label: configuration
+
+# --- Data -------------------------------------------------------------------
+WET_PATH     <- here("data-raw", "WetData_2013_2023.csv")
+SPECTRA_PATH <- here("data-raw", "1320_Jumpei_spectra_outlier_full.rds")
+BY_WET       <- "ID"
+BY_SPECTRA   <- "sample_id"
+
+# --- Target property --------------------------------------------------------
+TARGET <- "exCs137_totalCs137"
+
+# --- Filtering --------------------------------------------------------------
+EXCLUDE_YEARS <- c(2021, 2022, 2023)
+
+# --- Preprocessing ----------------------------------------------------------
+RESAMPLE_BY <- 5L
+
+# --- SG tuning grid ---------------------------------------------------------
+SG_W_MIN <- 5L    # must be odd
+SG_W_MAX <- 15L   # must be odd
+SG_P_MAX <- 3L    # constraints enforced in grid: p < w and p >= m
+SG_M_MAX <- 2L    # derivative order: 0 = smoothing, 1 = first, 2 = second
+
+# --- Splitting --------------------------------------------------------------
+SEED            <- 123L
+TRAIN_PROP      <- 0.75
+CALIB_PROP      <- 0.65
+KS_MAX_EXPL_VAR <- 0.99
+
+# --- PLSR -------------------------------------------------------------------
+MAX_NCOMP <- 50L
+
+set.seed(SEED)
+```
+
+# Load & Prepare
+
+```{r}
+#| label: load
+
+raw <- load_raw_data(
+  wet_path     = WET_PATH,
+  spectra_path = SPECTRA_PATH,
+  by_wet       = BY_WET,
+  by_spectra   = BY_SPECTRA
+)
+```
+
+```{r}
+#| label: prepare
+
+prepared <- raw |>
+  filter(
+    !year %in% EXCLUDE_YEARS,
+    !is.na(.data[[TARGET]]),
+    .data[[TARGET]] > 0
+  )
+nrow(prepared)
+```
+
+# Split
+
+```{r}
+#| label: split
+
+split <- ks_split(prepared, train_prop = TRAIN_PROP, calib_prop = CALIB_PROP)
+```
+
+# Recipe
+
+```{r}
+#| label: recipe
+
+spc_cols  <- grep("^X\\d+", names(training(split)), value = TRUE)
+meta_cols <- setdiff(names(training(split)), c(TARGET, spc_cols))
+
+rec <- recipe(training(split)) |>
+  update_role(all_of(TARGET),    new_role = "outcome")   |>
+  update_role(all_of(spc_cols),  new_role = "predictor") |>
+  update_role(all_of(meta_cols), new_role = "metadata")  |>
+  step_log(all_outcomes())          |>
+  step_resample(by = RESAMPLE_BY)   |>
+  step_snv()                        |>
+  step_sg(w = tune(), p = tune(), m = tune())
+```
+
+# Tune
+
+```{r}
+#| label: pls-workflow
+
+pls_wf <- workflow() |>
+  add_recipe(rec) |>
+  add_model(
+    pls(num_comp = tune()) |>
+      set_engine("mixOmics") |>
+      set_mode("regression")
+  )
+```
+
+```{r}
+#| label: joint-grid
+
+sg_grid <- expand.grid(
+  w = seq(SG_W_MIN, SG_W_MAX, by = 2L),
+  p = seq_len(SG_P_MAX),
+  m = seq(0L, SG_M_MAX)
+) |>
+  filter(p < w, p >= m)
+
+joint_grid <- expand_grid(
+  num_comp = seq_len(MAX_NCOMP),
+  sg_grid
+)
+
+nrow(joint_grid)
+```
+
+```{r}
+#| label: tune-sg
+
+sg_tuned <- tune_grid(
+  pls_wf,
+  resamples = validation_set(split),
+  grid      = joint_grid,
+  metrics   = metric_set(rmse, rsq)
+)
+```
+
+# Results
+
+```{r}
+#| label: fig-sg-heatmap
+
+collect_metrics(sg_tuned) |>
+  filter(.metric == "rmse") |>
+  group_by(w, p, m) |>
+  summarise(best_rmse = min(mean), .groups = "drop") |>
+  ggplot(aes(x = factor(w), y = factor(p), fill = best_rmse)) +
+  geom_tile() +
+  geom_text(aes(label = round(best_rmse, 3)), size = 3) +
+  scale_fill_distiller(palette = "YlOrRd", direction = 1) +
+  facet_wrap(~ paste0("m = ", m)) +
+  labs(
+    x     = "Window size (w)",
+    y     = "Polynomial degree (p)",
+    fill  = "Best RMSE",
+    title = "Best RMSE across num_comp — by SG parameters, faceted by derivative order"
+  ) +
+  theme_bw()
+```
+
+```{r}
+#| label: fig-ncomp-by-sg
+
+collect_metrics(sg_tuned) |>
+  filter(.metric == "rmse") |>
+  mutate(sg_label = glue::glue("w={w}, p={p}")) |>
+  ggplot(aes(x = num_comp, y = mean, colour = sg_label, group = sg_label)) +
+  geom_line(alpha = 0.5) +
+  facet_wrap(~ paste0("m = ", m)) +
+  labs(
+    x      = "Number of PLS components",
+    y      = "RMSE (validation)",
+    colour = "SG (w, p)",
+    title  = "Validation RMSE by num_comp — faceted by derivative order"
+  ) +
+  theme_bw()
+```
+
+```{r}
+#| label: best-params
+
+best <- select_best(sg_tuned, metric = "rmse")
+best
+
+glue::glue(
+  "→ Update cs137_ratio.qmd:\n",
+  "  SG_W <- {best$w}L\n",
+  "  SG_P <- {best$p}L"
+)
+```

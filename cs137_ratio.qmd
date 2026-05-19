@@ -52,9 +52,9 @@ EXCLUDE_YEARS <- c(2021, 2022, 2023)
 
 # --- Preprocessing ----------------------------------------------------------
 RESAMPLE_BY <- 5L
-SG_W        <- 11L
-SG_P        <- 2L
-SG_M        <- 1L
+SG_W        <- 15L   # tuned in tune_sg.qmd
+SG_P        <- 3L    # tuned in tune_sg.qmd
+SG_M        <- 1L    # first derivative — confirmed in tune_sg.qmd
 
 # --- Splitting --------------------------------------------------------------
 SEED            <- 123L
