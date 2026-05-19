@@ -13,6 +13,17 @@ execute:
   message: false
 ---
 
+Savitzky-Golay (SG) smoothing and differentiation is applied to MIR spectra
+before modelling to suppress baseline drift and sharpen absorption features.
+It has three parameters: window size `w` (number of channels), polynomial
+degree `p`, and derivative order `m`. These interact non-trivially with the
+number of PLS components, so they are tuned jointly with PLSR rather than
+fixed by convention.
+
+The target property here is `log10(exCs137 / totalCs137)` — the same as the
+primary modelling notebook — so the parameters found here are directly
+transferable.
+
 # Setup
 
 ```{r}
@@ -94,6 +105,11 @@ nrow(prepared)
 
 # Split
 
+Kennard-Stone sampling on spectral PCA scores ensures the training set covers
+the spectral space uniformly. This matters for SG tuning: a training set that
+leaves spectral gaps could favour parameters that happen to smooth over noisy
+regions rather than parameters that extract genuine chemical information.
+
 ```{r}
 #| label: split
 
@@ -101,6 +117,11 @@ split <- ks_split(prepared, train_prop = TRAIN_PROP, calib_prop = CALIB_PROP)
 ```
 
 # Recipe
+
+The SG parameters `w`, `p`, and `m` are marked as `tune()` so the grid search
+can vary them. All other preprocessing steps are fixed: log₁₀ outcome
+transform, spectral resampling at `r RESAMPLE_BY` cm⁻¹, and SNV scatter
+correction applied before SG differentiation.
 
 ```{r}
 #| label: recipe
@@ -120,6 +141,13 @@ rec <- recipe(training(split)) |>
 
 # Tune
 
+## Workflow
+
+PLSR is used as the model for tuning because it is fast, well-suited to
+high-dimensional collinear spectra, and its optimal component count is
+informative: if good SG parameters require many components, the preprocessing
+is doing little useful work.
+
 ```{r}
 #| label: pls-workflow
 
@@ -131,6 +159,14 @@ pls_wf <- workflow() |>
       set_mode("regression")
   )
 ```
+
+## Grid
+
+The SG grid is constructed explicitly to respect two hard constraints:
+polynomial degree must be strictly less than the window size (`p < w`), and
+the derivative order must not exceed the polynomial degree (`m ≤ p`). Violating
+either makes the filter mathematically ill-defined. The joint grid crosses all
+valid SG combinations with every PLS component count up to `MAX_NCOMP`.
 
 ```{r}
 #| label: joint-grid
@@ -163,6 +199,14 @@ sg_tuned <- tune_grid(
 
 # Results
 
+## Heatmap — best RMSE by SG parameters
+
+Each tile shows the best validation RMSE achievable with that `(w, p)`
+combination, minimised over all `num_comp` values. Facets separate the three
+derivative orders: `m = 0` is pure smoothing, `m = 1` is the first derivative
+(removes additive baseline), `m = 2` is the second derivative (removes linear
+baseline). Darker tiles indicate worse performance.
+
 ```{r}
 #| label: fig-sg-heatmap
 
@@ -184,6 +228,14 @@ collect_metrics(sg_tuned) |>
   theme_bw()
 ```
 
+## RMSE vs number of components
+
+The curves below show how validation RMSE evolves with the number of PLS
+components for every valid SG combination, again faceted by derivative order.
+A combination that reaches its minimum quickly (few components) and at a low
+RMSE value is preferred — it suggests the preprocessing is extracting compact,
+informative features.
+
 ```{r}
 #| label: fig-ncomp-by-sg
 
@@ -201,6 +253,8 @@ collect_metrics(sg_tuned) |>
   ) +
   theme_bw()
 ```
+
+## Best parameters
 
 ```{r}
 #| label: best-params
