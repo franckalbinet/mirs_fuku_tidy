@@ -67,3 +67,33 @@ ks_split <- function(data,
   class(res) <- c("initial_validation_split", "three_way_split")
   res
 }
+
+
+# Kennard-Stone split into a train pool (for CV-based tuning) and a fixed test set.
+# Stage 1 only — same seed/pool_prop as ks_split(), so the test set is
+# identical to ks_split()'s test set (directly comparable metrics).
+# Returns a two-way rsplit — training(split) is the pool, testing(split) is the test set.
+ks_pool_split <- function(data,
+                           pool_prop    = 0.75,
+                           max_expl_var = 0.99,
+                           seed         = 123L) {
+  n <- nrow(data)
+
+  set.seed(seed)
+  ks_pool <- prospectr::kenStone(
+    X = pca_scores(data, max_expl_var),
+    k = floor(n * pool_prop), metric = "mahal",
+    .center = TRUE, .scale = FALSE
+  )
+  pool_idx <- as.integer(sort(ks_pool$model))
+  test_idx <- as.integer(sort(ks_pool$test))
+
+  message(glue::glue(
+    "KS pool split: {length(pool_idx)} pool | {length(test_idx)} test"
+  ))
+
+  rsample::make_splits(
+    x    = list(analysis = pool_idx, assessment = test_idx),
+    data = data
+  )
+}

@@ -282,18 +282,22 @@ absorption bands.
 #| label: fig-global-vip
 
 extract_fit_engine(global_final)$usage |>
-  mutate(
-    importance = Conditions + Model,
-    wn         = as.numeric(str_remove(Variable, "^X"))
-  ) |>
+  mutate(wn = as.numeric(str_remove(Variable, "^X"))) |>
   filter(!is.na(wn)) |>
-  ggplot(aes(x = wn, y = importance)) +
+  arrange(wn) |>
+  mutate(
+    Conditions = slider::slide_dbl(Conditions, mean, .before = 5L, .after = 5L, .complete = TRUE),
+    Model      = slider::slide_dbl(Model,      mean, .before = 5L, .after = 5L, .complete = TRUE)
+  ) |>
+  pivot_longer(c(Conditions, Model), names_to = "role", values_to = "usage") |>
+  ggplot(aes(x = wn, y = usage, colour = role)) +
   geom_line() +
   scale_x_reverse() +
   labs(
-    x     = expression("Wavenumber /" * cm^-1),
-    y     = "Variable usage (%)",
-    title = "Global model — variable importance"
+    x      = expression("Wavenumber /" * cm^-1),
+    y      = "Variable usage (%)",
+    colour = NULL,
+    title  = "Global model — variable importance"
   )
 ```
 
@@ -417,18 +421,22 @@ walk(soil_results, function(res) {
     )
 
   p_vip <- extract_fit_engine(res$final)$usage |>
-    mutate(
-      importance = Conditions + Model,
-      wn         = as.numeric(str_remove(Variable, "^X"))
-    ) |>
+    mutate(wn = as.numeric(str_remove(Variable, "^X"))) |>
     filter(!is.na(wn)) |>
-    ggplot(aes(x = wn, y = importance)) +
+    arrange(wn) |>
+    mutate(
+      Conditions = slider::slide_dbl(Conditions, mean, .before = 5L, .after = 5L, .complete = TRUE),
+      Model      = slider::slide_dbl(Model,      mean, .before = 5L, .after = 5L, .complete = TRUE)
+    ) |>
+    pivot_longer(c(Conditions, Model), names_to = "role", values_to = "usage") |>
+    ggplot(aes(x = wn, y = usage, colour = role)) +
     geom_line() +
     scale_x_reverse() +
     labs(
-      x     = expression("Wavenumber /" * cm^-1),
-      y     = "Variable usage (%)",
-      title = glue::glue("{res$label} — variable importance")
+      x      = expression("Wavenumber /" * cm^-1),
+      y      = "Variable usage (%)",
+      colour = NULL,
+      title  = glue::glue("{res$label} — variable importance")
     )
 
   print(p_obs_pred)
@@ -512,18 +520,22 @@ walk(lowland_results, function(res) {
     )
 
   p_vip <- extract_fit_engine(res$final)$usage |>
-    mutate(
-      importance = Conditions + Model,
-      wn         = as.numeric(str_remove(Variable, "^X"))
-    ) |>
+    mutate(wn = as.numeric(str_remove(Variable, "^X"))) |>
     filter(!is.na(wn)) |>
-    ggplot(aes(x = wn, y = importance)) +
+    arrange(wn) |>
+    mutate(
+      Conditions = slider::slide_dbl(Conditions, mean, .before = 5L, .after = 5L, .complete = TRUE),
+      Model      = slider::slide_dbl(Model,      mean, .before = 5L, .after = 5L, .complete = TRUE)
+    ) |>
+    pivot_longer(c(Conditions, Model), names_to = "role", values_to = "usage") |>
+    ggplot(aes(x = wn, y = usage, colour = role)) +
     geom_line() +
     scale_x_reverse() +
     labs(
-      x     = expression("Wavenumber /" * cm^-1),
-      y     = "Variable usage (%)",
-      title = glue::glue("Lowland — {res$label} — variable importance")
+      x      = expression("Wavenumber /" * cm^-1),
+      y      = "Variable usage (%)",
+      colour = NULL,
+      title  = glue::glue("Lowland — {res$label} — variable importance")
     )
 
   print(p_obs_pred)

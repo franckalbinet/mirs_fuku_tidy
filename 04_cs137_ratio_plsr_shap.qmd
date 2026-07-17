@@ -1,0 +1,510 @@
+---
+title: "log10(exCs137 / total Cs137) — PLSR global vs. per soil type + SHAP"
+author: Franck Albinet
+date: last-modified
+format:
+  html:
+    toc: true
+    code-fold: true
+    theme: cosmo
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+Does soil type matter for MIR-based prediction of the exchangeable-to-total
+¹³⁷Cs ratio, and which spectral regions drive the predictions? This notebook
+mirrors `03_cs137_ratio_cubist_by_soil.qmd` but replaces Cubist with PLSR and
+replaces the Cubist usage-count importance (which can exceed 100 % and ignores
+coefficient magnitudes) with SHAP values.
+
+SHAP values are computed on the **post-recipe (SG-derivative) feature space**:
+the training and test sets are baked through the prepped recipe before
+KernelSHAP is called on the extracted parsnip model. This keeps the feature
+space identical to the Cubist notebook so spectral importance profiles are
+directly comparable across models.
+
+1. **Global PLSR model** — trained on all soil types combined, with test-set
+   metrics broken down by `Soil_type_describe`.
+2. **Per-soil PLSR models** — one independent model per soil type group
+   (minimum 60 samples), each with its own Kennard-Stone split and
+   component-number tuning.
+
+# Setup
+
+```{r}
+#| label: libraries
+
+library(tidyverse)
+library(tidymodels)
+library(plsmod)
+library(prospectr)
+library(resemble)
+library(here)
+library(kernelshap)
+library(shapviz)
+library(future)
+
+source(here("R", "utils.R"))
+source(here("R", "load.R"))
+source(here("R", "steps.R"))
+source(here("R", "split.R"))
+
+library(doParallel)
+registerDoParallel(cores = parallel::detectCores() - 1L)
+```
+
+```{r}
+#| label: configuration
+
+WET_PATH     <- here("data-raw", "WetData_2013_2023.csv")
+SPECTRA_PATH <- here("data-raw", "1320_Jumpei_spectra_outlier_full.rds")
+BY_WET       <- "ID"
+BY_SPECTRA   <- "sample_id"
+
+TARGET <- "exCs137_totalCs137"
+
+EXCLUDE_YEARS <- c(2021, 2022, 2023)
+
+RESAMPLE_BY <- 5L
+SG_W        <- 15L
+SG_P        <- 3L
+SG_M        <- 1L
+
+SEED        <- 123L
+TRAIN_PROP  <- 0.80
+CALIB_PROP  <- 0.70
+MIN_GROUP_N <- 60L
+
+N_COMP_MAX <- 30L   # maximum PLS components to search
+BG_N       <- 75L   # KernelSHAP background sample size
+SHAP_M     <- 100L  # on-off vectors per iteration (default = 2 * n_features ≈ 1340)
+SHAP_TOL   <- 0.01  # convergence tolerance (default 0.005)
+
+set.seed(SEED)
+```
+
+# Load & Prepare
+
+```{r}
+#| label: load
+
+raw <- load_raw_data(
+  wet_path     = WET_PATH,
+  spectra_path = SPECTRA_PATH,
+  by_wet       = BY_WET,
+  by_spectra   = BY_SPECTRA
+)
+```
+
+```{r}
+#| label: prepare
+
+prepared <- raw |>
+  filter(
+    !year %in% EXCLUDE_YEARS,
+    !is.na(.data[[TARGET]]),
+    .data[[TARGET]] > 0
+  )
+nrow(prepared)
+```
+
+# Shared PLSR specification
+
+PLSR handles the high collinearity of MIR spectra natively by projecting
+predictors onto latent components that maximise covariance with the response.
+The number of components is the only hyperparameter; the grid searches even
+values from 2 to `r N_COMP_MAX`.
+
+```{r}
+#| label: pls-spec
+pls_spec <- pls(num_comp = tune()) |>
+  set_engine("mixOmics") |>
+  set_mode("regression")
+
+pls_grid <- tibble(num_comp = seq(2L, N_COMP_MAX, by = 2L))
+```
+
+# Shared helpers
+
+`compute_shap()` bakes a data split through the prepped recipe, draws a
+background from the training set, and returns a `shapviz` object for the test
+set. `plot_shap_spectrum()` converts that object into a spectral importance
+profile (mean |SHAP| vs wavenumber) comparable to the Cubist usage plots.
+
+```{r}
+#| label: helpers
+
+# Bake split; run KernelSHAP on test set; returns shapviz object
+compute_shap <- function(last_fit_obj, split) {
+  rec_p   <- extract_workflow(last_fit_obj) |> extract_recipe(estimated = TRUE)
+  model   <- extract_fit_parsnip(last_fit_obj)
+
+  train_b <- bake(rec_p, new_data = training(split),  all_predictors())
+  test_b  <- bake(rec_p, new_data = testing(split),   all_predictors())
+
+  bg <- slice_sample(train_b, n = BG_N)
+  pf <- function(m, x, ...) predict(m, new_data = x)$.pred
+
+  # multisession is safe here: workers only call predict() on baked data,
+  # never see custom recipe steps
+  plan(multisession, workers = parallel::detectCores() - 1L)
+  on.exit(plan(sequential))
+
+  ks <- kernelshap(
+    model,
+    X        = test_b,
+    bg_X     = bg,
+    pred_fun = pf,
+    m        = SHAP_M,
+    tol      = SHAP_TOL,
+    parallel = TRUE
+  )
+  shapviz(ks)
+}
+
+# Plot mean |SHAP| as a line against wavenumber
+plot_shap_spectrum <- function(sv, title) {
+  as.data.frame(sv$S) |>
+    summarise(across(everything(), \(x) mean(abs(x)))) |>
+    pivot_longer(everything(), names_to = "variable", values_to = "mean_abs_shap") |>
+    mutate(wn = as.numeric(str_remove(variable, "^X"))) |>
+    filter(!is.na(wn)) |>
+    ggplot(aes(x = wn, y = mean_abs_shap)) +
+    geom_line() +
+    scale_x_reverse() +
+    labs(
+      x     = expression("Wavenumber /" * cm^-1),
+      y     = "Mean |SHAP|",
+      title = title
+    )
+}
+```
+
+# Global model
+
+## Split
+
+```{r}
+#| label: global-split
+
+global_split <- ks_split(prepared, train_prop = TRAIN_PROP, calib_prop = CALIB_PROP)
+```
+
+## Recipe
+
+```{r}
+#| label: global-recipe
+
+spc_cols  <- grep("^X\\d+", names(training(global_split)), value = TRUE)
+meta_cols <- setdiff(names(training(global_split)), c(TARGET, spc_cols))
+
+global_rec <- recipe(training(global_split)) |>
+  update_role(all_of(TARGET),    new_role = "outcome")   |>
+  update_role(all_of(spc_cols),  new_role = "predictor") |>
+  update_role(all_of(meta_cols), new_role = "metadata")  |>
+  step_log(all_outcomes(), base = 10) |>
+  step_resample(by = RESAMPLE_BY)    |>
+  step_snv()                         |>
+  step_sg(w = SG_W, p = SG_P, m = SG_M)
+```
+
+## Tune
+
+```{r}
+#| label: global-wf
+
+global_wf <- workflow() |>
+  add_recipe(global_rec) |>
+  add_model(pls_spec)
+```
+
+```{r}
+#| label: global-tune
+
+global_tuned <- tune_grid(
+  global_wf,
+  resamples = validation_set(global_split),
+  grid      = pls_grid,
+  metrics   = metric_set(rmse, rsq)
+)
+```
+
+```{r}
+#| label: fig-global-tuning
+
+autoplot(global_tuned)
+```
+
+## Final fit
+
+```{r}
+#| label: global-final
+
+global_final <- global_wf |>
+  finalize_workflow(select_best(global_tuned, metric = "rmse")) |>
+  last_fit(global_split)
+
+collect_metrics(global_final)
+```
+
+## Observed vs predicted
+
+```{r}
+#| label: fig-global-obs-pred
+
+collect_predictions(global_final) |>
+  ggplot(aes(x = .pred, y = .data[[TARGET]])) +
+  geom_point(alpha = 0.4) +
+  geom_abline(colour = "red", linetype = "dashed") +
+  coord_obs_pred() +
+  labs(
+    x     = "Predicted log10(exCs137 / totalCs137)",
+    y     = "Observed log10(exCs137 / totalCs137)",
+    title = glue::glue(
+      "Global PLSR  |  RMSE = {round(collect_metrics(global_final) |> filter(.metric == 'rmse') |> pull(.estimate), 3)},",
+      "  R² = {round(collect_metrics(global_final) |> filter(.metric == 'rsq') |> pull(.estimate), 3)}"
+    )
+  )
+```
+
+## Metrics by soil type
+
+```{r}
+#| label: global-metrics-by-soil
+
+collect_predictions(global_final) |>
+  left_join(
+    testing(global_split) |>
+      mutate(.row = row_number()) |>
+      select(.row, Soil_type_describe),
+    by = ".row"
+  ) |>
+  group_by(Soil_type_describe) |>
+  metrics(truth = !!sym(TARGET), estimate = .pred) |>
+  print(n = Inf)
+```
+
+## SHAP importance
+
+KernelSHAP is run on the `r BG_N`-sample training background and the full
+test set, both baked through the prepped recipe. Mean absolute SHAP by
+wavenumber is the spectral importance profile: unlike Cubist usage counts, the
+values are bounded, magnitude-weighted, and can be compared directly across
+models.
+
+```{r}
+#| label: global-shap
+
+global_sv <- compute_shap(global_final, global_split)
+```
+
+```{r}
+#| label: fig-global-shap
+
+plot_shap_spectrum(global_sv, "Global PLSR — mean |SHAP| by wavenumber")
+```
+
+# Per-soil models
+
+## Group sizes
+
+```{r}
+#| label: soil-group-sizes
+
+group_sizes <- prepared |>
+  count(Soil_type_describe, name = "n") |>
+  arrange(desc(n))
+
+group_sizes
+
+skipped <- group_sizes |> filter(n < MIN_GROUP_N)
+if (nrow(skipped) > 0) {
+  message(
+    "Skipping ", nrow(skipped), " group(s) with n < ", MIN_GROUP_N, ": ",
+    paste(skipped$Soil_type_describe, collapse = ", ")
+  )
+}
+```
+
+## Fit per group
+
+```{r}
+#| label: soil-fit-fn
+
+# Fit a PLSR workflow on one subset; returns a named list
+fit_soil_pls <- function(grp, label = unique(grp$Soil_type_describe)) {
+  split <- ks_split(grp, train_prop = TRAIN_PROP, calib_prop = CALIB_PROP)
+
+  spc_c  <- grep("^X\\d+", names(training(split)), value = TRUE)
+  meta_c <- setdiff(names(training(split)), c(TARGET, spc_c))
+
+  rec <- recipe(training(split)) |>
+    update_role(all_of(TARGET),  new_role = "outcome")   |>
+    update_role(all_of(spc_c),   new_role = "predictor") |>
+    update_role(all_of(meta_c),  new_role = "metadata")  |>
+    step_log(all_outcomes(), base = 10) |>
+    step_resample(by = RESAMPLE_BY)    |>
+    step_snv()                         |>
+    step_sg(w = SG_W, p = SG_P, m = SG_M)
+
+  wf <- workflow() |>
+    add_recipe(rec) |>
+    add_model(pls_spec)
+
+  tuned <- tune_grid(
+    wf,
+    resamples = validation_set(split),
+    grid      = pls_grid,
+    metrics   = metric_set(rmse, rsq)
+  )
+
+  final <- wf |>
+    finalize_workflow(select_best(tuned, metric = "rmse")) |>
+    last_fit(split)
+
+  list(label = label, n = nrow(grp), split = split, tuned = tuned, final = final)
+}
+```
+
+```{r}
+#| label: soil-fit
+
+soil_results <- prepared |>
+  group_by(Soil_type_describe) |>
+  filter(n() >= MIN_GROUP_N) |>
+  group_split() |>
+  map(fit_soil_pls)
+```
+
+## SHAP per soil type
+
+```{r}
+#| label: soil-shap
+
+soil_sv <- map(soil_results, \(res) compute_shap(res$final, res$split))
+```
+
+## Results per soil type
+
+```{r}
+#| label: fig-soil-results
+
+walk2(soil_results, soil_sv, function(res, sv) {
+  mets     <- collect_metrics(res$final)
+  rmse_val <- mets |> filter(.metric == "rmse") |> pull(.estimate) |> round(3)
+  rsq_val  <- mets |> filter(.metric == "rsq")  |> pull(.estimate) |> round(3)
+
+  p_obs_pred <- collect_predictions(res$final) |>
+    ggplot(aes(x = .pred, y = .data[[TARGET]])) +
+    geom_point(alpha = 0.4) +
+    geom_abline(colour = "red", linetype = "dashed") +
+    coord_obs_pred() +
+    labs(
+      x     = "Predicted log10(exCs137 / totalCs137)",
+      y     = "Observed log10(exCs137 / totalCs137)",
+      title = glue::glue(
+        "{res$label}  (n = {res$n})  |  RMSE = {rmse_val},  R² = {rsq_val}"
+      )
+    )
+
+  p_shap <- plot_shap_spectrum(sv, glue::glue("{res$label} — mean |SHAP|"))
+
+  print(p_obs_pred)
+  print(p_shap)
+})
+```
+
+## Metrics summary
+
+```{r}
+#| label: soil-metrics-summary
+
+map(soil_results, function(res) {
+  collect_metrics(res$final) |>
+    mutate(soil_type = res$label, n = res$n)
+}) |>
+  list_rbind() |>
+  select(soil_type, n, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  arrange(desc(rsq))
+```
+
+# Lowland soil — by field type
+
+## Group sizes
+
+```{r}
+#| label: lowland-group-sizes
+
+prepared |>
+  filter(Soil_type_describe == "Lowland soil") |>
+  count(fieldtype, sort = TRUE)
+```
+
+## Fit per field type
+
+```{r}
+#| label: lowland-fit
+
+lowland_results <- prepared |>
+  filter(Soil_type_describe == "Lowland soil") |>
+  group_by(fieldtype) |>
+  filter(n() >= MIN_GROUP_N) |>
+  group_split() |>
+  map(\(grp) fit_soil_pls(grp, label = unique(grp$fieldtype)))
+```
+
+## SHAP per field type
+
+```{r}
+#| label: lowland-shap
+
+lowland_sv <- map(lowland_results, \(res) compute_shap(res$final, res$split))
+```
+
+## Results per field type
+
+```{r}
+#| label: fig-lowland-results
+
+walk2(lowland_results, lowland_sv, function(res, sv) {
+  mets     <- collect_metrics(res$final)
+  rmse_val <- mets |> filter(.metric == "rmse") |> pull(.estimate) |> round(3)
+  rsq_val  <- mets |> filter(.metric == "rsq")  |> pull(.estimate) |> round(3)
+
+  p_obs_pred <- collect_predictions(res$final) |>
+    ggplot(aes(x = .pred, y = .data[[TARGET]])) +
+    geom_point(alpha = 0.4) +
+    geom_abline(colour = "red", linetype = "dashed") +
+    coord_obs_pred() +
+    labs(
+      x     = "Predicted log10(exCs137 / totalCs137)",
+      y     = "Observed log10(exCs137 / totalCs137)",
+      title = glue::glue(
+        "Lowland — {res$label}  (n = {res$n})  |  RMSE = {rmse_val},  R² = {rsq_val}"
+      )
+    )
+
+  p_shap <- plot_shap_spectrum(sv, glue::glue("Lowland — {res$label} — mean |SHAP|"))
+
+  print(p_obs_pred)
+  print(p_shap)
+})
+```
+
+## Metrics summary
+
+```{r}
+#| label: lowland-metrics-summary
+
+map(lowland_results, function(res) {
+  collect_metrics(res$final) |>
+    mutate(field_type = res$label, n = res$n)
+}) |>
+  list_rbind() |>
+  select(field_type, n, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  arrange(desc(rsq))
+```

@@ -67,6 +67,10 @@ TRAIN_PROP      <- 0.75
 CALIB_PROP      <- 0.65
 KS_MAX_EXPL_VAR <- 0.99
 
+# --- Cross-validation (pool + fixed KS test set) -----------------------------
+K_FOLDS    <- 10L
+CV_REPEATS <- 1L
+
 # --- Model ------------------------------------------------------------------
 MAX_NCOMP     <- 50L
 GRID_SIZE     <- 20L
@@ -128,6 +132,21 @@ prepared |>
 #| label: split
 
 split <- ks_split(prepared, train_prop = TRAIN_PROP, calib_prop = CALIB_PROP)
+```
+
+## Using Kennard-Stone pool + k-fold CV
+
+```{r}
+#| label: split-pool
+
+pool_split <- ks_pool_split(prepared, pool_prop = TRAIN_PROP, max_expl_var = KS_MAX_EXPL_VAR, seed = SEED)
+```
+
+```{r}
+#| label: cv-folds
+
+cv_folds <- vfold_cv(training(pool_split), v = K_FOLDS, repeats = CV_REPEATS, strata = TARGET)
+cv_folds
 ```
 
 # Recipe
@@ -259,6 +278,88 @@ pls_preds |>
   )
 
 pls_preds |>
+  mutate(
+    pred_orig = 10^.pred,
+    obs_orig  = 10^.data[[TARGET]]
+  ) |>
+  metrics(truth = obs_orig, estimate = pred_orig)
+```
+
+## PLSR — k-fold CV on pool
+
+Same recipe, model spec, and grid as above (`rec`, `pls_spec`, `pls_wf`, `pls_grid`) —
+only the resampling strategy changes: `num_comp` is tuned via k-fold CV on the
+KS pool instead of a single validation holdout, then the final model is fit on
+the full pool and scored on the same KS test set used above (`pool_split`'s test
+set is identical to `split`'s test set).
+
+```{r}
+#| label: pls-tune-cv
+
+pls_tuned_cv <- tune_grid(
+  pls_wf,
+  resamples = cv_folds,
+  grid      = pls_grid,
+  metrics   = metric_set(rmse, rsq)
+)
+```
+
+```{r}
+#| label: fig-pls-tuning-cv
+
+autoplot(pls_tuned_cv)
+```
+
+`select_by_one_std_err()` trades a bit of raw CV performance for a simpler
+(lower `num_comp`) model that's within noise of the numerical optimum picked
+by `select_best()`:
+
+```{r}
+#| label: pls-select-compare-cv
+
+pls_picks_cv <- bind_rows(
+  select_best(pls_tuned_cv, metric = "rmse") |>
+    mutate(rule = "select_best"),
+  select_by_one_std_err(pls_tuned_cv, num_comp, metric = "rmse") |>
+    mutate(rule = "select_by_one_std_err")
+)
+
+collect_metrics(pls_tuned_cv) |>
+  filter(.metric %in% c("rmse", "rsq")) |>
+  inner_join(pls_picks_cv |> select(rule, .config), by = ".config") |>
+  select(rule, num_comp, .metric, mean, std_err)
+```
+
+```{r}
+#| label: pls-final-cv
+
+pls_final_cv <- pls_wf |>
+  finalize_workflow(select_by_one_std_err(pls_tuned_cv, num_comp, metric = "rmse")) |>
+  last_fit(pool_split)
+
+collect_metrics(pls_final_cv)
+```
+
+```{r}
+#| label: fig-pls-obs-pred-cv
+
+pls_preds_cv <- collect_predictions(pls_final_cv)
+
+pls_preds_cv |>
+  ggplot(aes(x = .pred, y = .data[[TARGET]])) +
+  geom_point(alpha = 0.4) +
+  geom_abline(colour = "red", linetype = "dashed") +
+  coord_obs_pred() +
+  labs(
+    x     = "Predicted log10(exCs137 / totalCs137)",
+    y     = "Observed log10(exCs137 / totalCs137)",
+    title = glue::glue(
+      "PLSR (CV) test set  |  RMSE = {round(collect_metrics(pls_final_cv) |> filter(.metric == 'rmse') |> pull(.estimate), 3)},",
+      "  R² = {round(collect_metrics(pls_final_cv) |> filter(.metric == 'rsq') |> pull(.estimate), 3)}"
+    )
+  )
+
+pls_preds_cv |>
   mutate(
     pred_orig = 10^.pred,
     obs_orig  = 10^.data[[TARGET]]
